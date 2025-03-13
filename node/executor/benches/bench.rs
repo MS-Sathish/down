@@ -1,244 +1,663 @@
 // This file is part of Substrate.
 
 // Copyright (C) Parity Technologies (UK) Ltd.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 
-use clarus_node_executor as node_executor;
-use clarus_runtime::{
-    constants::currency::*, Block, BuildStorage, CheckedExtrinsic, Header, RuntimeCall,
-    RuntimeGenesisConfig, UncheckedExtrinsic,
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//! Benchmarking module.
+//!
+//! Utilities to do full-scale benchmarks involving database. With `BenchDb` you
+//! can pregenerate seed database and `clone` it for every iteration of your benchmarks
+//! or tests to get consistent, smooth benchmark experience!
+
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
+
+use crate::{
+	client::{Backend, Client},
+	keyring::*,
 };
 use codec::{Decode, Encode};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use frame_support::Hashable;
-use node_executor::ExecutorDispatch;
-use node_primitives::{BlockNumber, Hash};
-use node_testing::keyring::*;
-use sc_executor::{
-    Externalities, NativeElseWasmExecutor, RuntimeVersionOf, WasmExecutionMethod, WasmExecutor,
-    WasmtimeInstantiationStrategy,
+use futures::executor;
+use clarus_runtime::{
+	constants::currency::DOLLARS, AccountId, BalancesCall, CheckedExtrinsic, MinimumPeriod,
+	RuntimeCall, Signature, SystemCall, UncheckedExtrinsic,
 };
-use sp_core::{
-    storage::well_known_keys,
-    traits::{CallContext, CodeExecutor, RuntimeCode},
+use node_primitives::Block;
+use sc_block_builder::BlockBuilderProvider;
+use sc_client_api::execution_extensions::ExecutionExtensions;
+use sc_client_db::PruningMode;
+use sc_consensus::{BlockImport, BlockImportParams, ForkChoiceStrategy, ImportResult, ImportedAux};
+use sc_executor::{NativeElseWasmExecutor, WasmExecutionMethod, WasmtimeInstantiationStrategy};
+use sp_api::ProvideRuntimeApi;
+use sp_block_builder::BlockBuilder;
+use sp_consensus::BlockOrigin;
+use sp_core::{blake2_256, ed25519, sr25519, traits::SpawnNamed, Pair, Public};
+use sp_inherents::InherentData;
+use sp_runtime::{
+	traits::{Block as BlockT, IdentifyAccount, Verify},
+	OpaqueExtrinsic,
 };
-use sp_runtime::traits::BlakeTwo256;
-use sp_state_machine::TestExternalities as CoreTestExternalities;
 
-criterion_group!(benches, bench_execute_block);
-criterion_main!(benches);
-
-/// The wasm runtime code.
-pub fn compact_code_unwrap() -> &'static [u8] {
-    clarus_runtime::WASM_BINARY.expect(
-        "Development wasm binary is not available. Testing is only supported with the flag \
-		 disabled.",
-    )
+/// Keyring full of accounts for benching.
+///
+/// Accounts are ordered:
+///     //endowed-user//00
+///     //endowed-user//01
+///      ...
+///     //endowed-user//N
+#[derive(Clone)]
+pub struct BenchKeyring {
+	accounts: BTreeMap<AccountId, BenchPair>,
 }
 
-const GENESIS_HASH: [u8; 32] = [69u8; 32];
-
-const TRANSACTION_VERSION: u32 = clarus_runtime::VERSION.transaction_version;
-
-const SPEC_VERSION: u32 = clarus_runtime::VERSION.spec_version;
-
-const HEAP_PAGES: u64 = 20;
-
-type TestExternalities<H> = CoreTestExternalities<H>;
-
-#[derive(Debug)]
-enum ExecutionMethod {
-    Native,
-    Wasm(WasmExecutionMethod),
+#[derive(Clone)]
+enum BenchPair {
+	Sr25519(sr25519::Pair),
+	Ed25519(ed25519::Pair),
 }
 
-fn sign(xt: CheckedExtrinsic) -> UncheckedExtrinsic {
-    node_testing::keyring::sign(xt, SPEC_VERSION, TRANSACTION_VERSION, GENESIS_HASH)
+impl BenchPair {
+	fn sign(&self, payload: &[u8]) -> Signature {
+		match self {
+			Self::Sr25519(pair) => pair.sign(payload).into(),
+			Self::Ed25519(pair) => pair.sign(payload).into(),
+		}
+	}
 }
 
-fn new_test_ext(genesis_config: &RuntimeGenesisConfig) -> TestExternalities<BlakeTwo256> {
-    let mut test_ext = TestExternalities::new_with_code(
-        compact_code_unwrap(),
-        genesis_config.build_storage().unwrap(),
-    );
-    test_ext.ext().place_storage(
-        well_known_keys::HEAP_PAGES.to_vec(),
-        Some(HEAP_PAGES.encode()),
-    );
-    test_ext
+/// Drop system cache.
+///
+/// Will panic if cache drop is impossbile.
+pub fn drop_system_cache() {
+	#[cfg(target_os = "windows")]
+	{
+		log::warn!(
+			target: "bench-logistics",
+			"Clearing system cache on windows is not supported. Benchmark might totally be wrong.",
+		);
+		return
+	}
+
+	std::process::Command::new("sync")
+		.output()
+		.expect("Failed to execute system cache clear");
+
+	#[cfg(target_os = "linux")]
+	{
+		log::trace!(target: "bench-logistics", "Clearing system cache...");
+		std::process::Command::new("echo")
+			.args(&["3", ">", "/proc/sys/vm/drop_caches", "2>", "/dev/null"])
+			.output()
+			.expect("Failed to execute system cache clear");
+
+		let temp = tempfile::tempdir().expect("Failed to spawn tempdir");
+		let temp_file_path = format!("of={}/buf", temp.path().to_string_lossy());
+
+		// this should refill write cache with 2GB of garbage
+		std::process::Command::new("dd")
+			.args(&["if=/dev/urandom", &temp_file_path, "bs=64M", "count=32"])
+			.output()
+			.expect("Failed to execute dd for cache clear");
+
+		// remove tempfile of previous command
+		std::process::Command::new("rm")
+			.arg(&temp_file_path)
+			.output()
+			.expect("Failed to remove temp file");
+
+		std::process::Command::new("sync")
+			.output()
+			.expect("Failed to execute system cache clear");
+
+		log::trace!(target: "bench-logistics", "Clearing system cache done!");
+	}
+
+	#[cfg(target_os = "macos")]
+	{
+		log::trace!(target: "bench-logistics", "Clearing system cache...");
+		if let Err(err) = std::process::Command::new("purge").output() {
+			log::error!("purge error {:?}: ", err);
+			panic!("Could not clear system cache. Run under sudo?");
+		}
+		log::trace!(target: "bench-logistics", "Clearing system cache done!");
+	}
 }
 
-fn construct_block<E: Externalities>(
-    executor: &NativeElseWasmExecutor<ExecutorDispatch>,
-    ext: &mut E,
-    number: BlockNumber,
-    parent_hash: Hash,
-    extrinsics: Vec<CheckedExtrinsic>,
-) -> (Vec<u8>, Hash) {
-    use sp_trie::{LayoutV0, TrieConfiguration};
-
-    // sign extrinsics.
-    let extrinsics = extrinsics.into_iter().map(sign).collect::<Vec<_>>();
-
-    // calculate the header fields that we can.
-    let extrinsics_root =
-        LayoutV0::<BlakeTwo256>::ordered_trie_root(extrinsics.iter().map(Encode::encode))
-            .to_fixed_bytes()
-            .into();
-
-    let header = Header {
-        parent_hash,
-        number,
-        extrinsics_root,
-        state_root: Default::default(),
-        digest: Default::default(),
-    };
-
-    let runtime_code = RuntimeCode {
-        code_fetcher: &sp_core::traits::WrappedRuntimeCode(compact_code_unwrap().into()),
-        hash: vec![1, 2, 3],
-        heap_pages: None,
-    };
-
-    // execute the block to get the real header.
-    executor
-        .call(
-            ext,
-            &runtime_code,
-            "Core_initialize_block",
-            &header.encode(),
-            true,
-            CallContext::Offchain,
-        )
-        .0
-        .unwrap();
-
-    for i in extrinsics.iter() {
-        executor
-            .call(
-                ext,
-                &runtime_code,
-                "BlockBuilder_apply_extrinsic",
-                &i.encode(),
-                true,
-                CallContext::Offchain,
-            )
-            .0
-            .unwrap();
-    }
-
-    let header = Header::decode(
-        &mut &executor
-            .call(
-                ext,
-                &runtime_code,
-                "BlockBuilder_finalize_block",
-                &[0u8; 0],
-                true,
-                CallContext::Offchain,
-            )
-            .0
-            .unwrap()[..],
-    )
-    .unwrap();
-
-    let hash = header.blake2_256();
-    (Block { header, extrinsics }.encode(), hash.into())
+/// Pre-initialized benchmarking database.
+///
+/// This is prepared database with genesis and keyring
+/// that can be cloned and then used for any benchmarking.
+pub struct BenchDb {
+	keyring: BenchKeyring,
+	directory_guard: Guard,
+	database_type: DatabaseType,
 }
 
-fn test_blocks(
-    genesis_config: &RuntimeGenesisConfig,
-    executor: &NativeElseWasmExecutor<ExecutorDispatch>,
-) -> Vec<(Vec<u8>, Hash)> {
-    let mut test_ext = new_test_ext(genesis_config);
-    let mut block1_extrinsics = vec![CheckedExtrinsic {
-        signed: None,
-        function: RuntimeCall::Timestamp(pallet_timestamp::Call::set { now: 0 }),
-    }];
-    block1_extrinsics.extend((0..20).map(|i| CheckedExtrinsic {
-        signed: Some((alice(), signed_extra(i, 0))),
-        function: RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
-            dest: bob().into(),
-            value: 1 * DOLLARS,
-        }),
-    }));
-    let block1 = construct_block(
-        executor,
-        &mut test_ext.ext(),
-        1,
-        GENESIS_HASH.into(),
-        block1_extrinsics,
-    );
+impl Clone for BenchDb {
+	fn clone(&self) -> Self {
+		let keyring = self.keyring.clone();
+		let database_type = self.database_type;
+		let dir = tempfile::tempdir().expect("temp dir creation failed");
 
-    vec![block1]
+		let seed_dir = self.directory_guard.0.path();
+
+		log::trace!(
+			target: "bench-logistics",
+			"Copying seed db from {} to {}",
+			seed_dir.to_string_lossy(),
+			dir.path().to_string_lossy(),
+		);
+		let seed_db_files = std::fs::read_dir(seed_dir)
+			.expect("failed to list file in seed dir")
+			.map(|f_result| f_result.expect("failed to read file in seed db").path())
+			.collect::<Vec<PathBuf>>();
+		fs_extra::copy_items(&seed_db_files, dir.path(), &fs_extra::dir::CopyOptions::new())
+			.expect("Copy of seed database is ok");
+
+		// We clear system cache after db clone but before any warmups.
+		// This populates system cache with some data unrelated to actual
+		// data we will be quering further under benchmark (like what
+		// would have happened in real system that queries random entries
+		// from database).
+		drop_system_cache();
+
+		BenchDb { keyring, directory_guard: Guard(dir), database_type }
+	}
 }
 
-fn bench_execute_block(c: &mut Criterion) {
-    let mut group = c.benchmark_group("execute blocks");
-    let execution_methods = vec![
-        ExecutionMethod::Native,
-        ExecutionMethod::Wasm(WasmExecutionMethod::Compiled {
-            instantiation_strategy: WasmtimeInstantiationStrategy::PoolingCopyOnWrite,
-        }),
-    ];
+/// Type of block for generation
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum BlockType {
+	/// Bunch of random transfers.
+	RandomTransfersKeepAlive,
+	/// Bunch of random transfers that drain all of the source balance.
+	RandomTransfersReaping,
+	/// Bunch of "no-op" calls.
+	Noop,
+}
 
-    for strategy in execution_methods {
-        group.bench_function(format!("{:?}", strategy), |b| {
-            let genesis_config = node_testing::genesis::config();
-            let use_native = match strategy {
-                ExecutionMethod::Native => true,
-                ExecutionMethod::Wasm(..) => false,
-            };
+impl BlockType {
+	/// Create block content description with specified number of transactions.
+	pub fn to_content(self, size: Option<usize>) -> BlockContent {
+		BlockContent { block_type: self, size }
+	}
+}
 
-            let executor =
-                NativeElseWasmExecutor::new_with_wasm_executor(WasmExecutor::builder().build());
-            let runtime_code = RuntimeCode {
-                code_fetcher: &sp_core::traits::WrappedRuntimeCode(compact_code_unwrap().into()),
-                hash: vec![1, 2, 3],
-                heap_pages: None,
-            };
+/// Content of the generated block.
+#[derive(Clone, Debug)]
+pub struct BlockContent {
+	block_type: BlockType,
+	size: Option<usize>,
+}
 
-            // Get the runtime version to initialize the runtimes cache.
-            {
-                let mut test_ext = new_test_ext(&genesis_config);
-                executor
-                    .runtime_version(&mut test_ext.ext(), &runtime_code)
-                    .unwrap();
-            }
+/// Type of backend database.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DatabaseType {
+	/// RocksDb backend.
+	RocksDb,
+	/// Parity DB backend.
+	ParityDb,
+}
 
-            let blocks = test_blocks(&genesis_config, &executor);
+impl DatabaseType {
+	fn into_settings(self, path: PathBuf) -> sc_client_db::DatabaseSource {
+		match self {
+			Self::RocksDb => sc_client_db::DatabaseSource::RocksDb { path, cache_size: 512 },
+			Self::ParityDb => sc_client_db::DatabaseSource::ParityDb { path },
+		}
+	}
+}
 
-            b.iter_batched_ref(
-                || new_test_ext(&genesis_config),
-                |test_ext| {
-                    for block in blocks.iter() {
-                        executor
-                            .call(
-                                &mut test_ext.ext(),
-                                &runtime_code,
-                                "Core_execute_block",
-                                &block.0,
-                                use_native,
-                                CallContext::Offchain,
-                            )
-                            .0
-                            .unwrap();
-                    }
-                },
-                BatchSize::LargeInput,
-            );
-        });
-    }
+/// Benchmarking task executor.
+///
+/// Uses multiple threads as the regular executable.
+#[derive(Debug, Clone)]
+pub struct TaskExecutor {
+	pool: executor::ThreadPool,
+}
+
+impl TaskExecutor {
+	fn new() -> Self {
+		Self { pool: executor::ThreadPool::new().expect("Failed to create task executor") }
+	}
+}
+
+impl SpawnNamed for TaskExecutor {
+	fn spawn(
+		&self,
+		_: &'static str,
+		_: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
+		self.pool.spawn_ok(future);
+	}
+
+	fn spawn_blocking(
+		&self,
+		_: &'static str,
+		_: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
+		self.pool.spawn_ok(future);
+	}
+}
+
+/// Iterator for block content.
+pub struct BlockContentIterator<'a> {
+	iteration: usize,
+	content: BlockContent,
+	runtime_version: sc_executor::RuntimeVersion,
+	genesis_hash: node_primitives::Hash,
+	keyring: &'a BenchKeyring,
+}
+
+impl<'a> BlockContentIterator<'a> {
+	fn new(content: BlockContent, keyring: &'a BenchKeyring, client: &Client) -> Self {
+		let genesis_hash = client.chain_info().genesis_hash;
+		let runtime_version = client
+			.runtime_version_at(genesis_hash)
+			.expect("There should be runtime version at 0");
+
+		BlockContentIterator { iteration: 0, content, keyring, runtime_version, genesis_hash }
+	}
+}
+
+impl<'a> Iterator for BlockContentIterator<'a> {
+	type Item = OpaqueExtrinsic;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.content.size.map(|size| size <= self.iteration).unwrap_or(false) {
+			return None
+		}
+
+		let sender = self.keyring.at(self.iteration);
+		let receiver = get_account_id_from_seed::<sr25519::Public>(&format!(
+			"random-user//{}",
+			self.iteration
+		));
+
+		let signed = self.keyring.sign(
+			CheckedExtrinsic {
+				signed: Some((
+					sender,
+					signed_extra(0, clarus_runtime::ExistentialDeposit::get() + 1),
+				)),
+				function: match self.content.block_type {
+					BlockType::RandomTransfersKeepAlive =>
+						RuntimeCall::Balances(BalancesCall::transfer_keep_alive {
+							dest: sp_runtime::MultiAddress::Id(receiver),
+							value: clarus_runtime::ExistentialDeposit::get() + 1,
+						}),
+					BlockType::RandomTransfersReaping => {
+						RuntimeCall::Balances(BalancesCall::transfer_allow_death {
+							dest: sp_runtime::MultiAddress::Id(receiver),
+							// Transfer so that ending balance would be 1 less than existential
+							// deposit so that we kill the sender account.
+							value: 100 * DOLLARS -
+								(clarus_runtime::ExistentialDeposit::get() - 1),
+						})
+					},
+					BlockType::Noop =>
+						RuntimeCall::System(SystemCall::remark { remark: Vec::new() }),
+				},
+			},
+			self.runtime_version.spec_version,
+			self.runtime_version.transaction_version,
+			self.genesis_hash.into(),
+		);
+
+		let encoded = Encode::encode(&signed);
+
+		let opaque = OpaqueExtrinsic::decode(&mut &encoded[..]).expect("Failed  to decode opaque");
+
+		self.iteration += 1;
+
+		Some(opaque)
+	}
+}
+
+impl BenchDb {
+	/// New immutable benchmarking database.
+	///
+	/// See [`BenchDb::new`] method documentation for more information about the purpose
+	/// of this structure.
+	pub fn with_key_types(
+		database_type: DatabaseType,
+		keyring_length: usize,
+		key_types: KeyTypes,
+	) -> Self {
+		let keyring = BenchKeyring::new(keyring_length, key_types);
+
+		let dir = tempfile::tempdir().expect("temp dir creation failed");
+		log::trace!(
+			target: "bench-logistics",
+			"Created seed db at {}",
+			dir.path().to_string_lossy(),
+		);
+		let (_client, _backend, _task_executor) =
+			Self::bench_client(database_type, dir.path(), &keyring);
+		let directory_guard = Guard(dir);
+
+		BenchDb { keyring, directory_guard, database_type }
+	}
+
+	/// New immutable benchmarking database.
+	///
+	/// This will generate database files in random temporary directory
+	/// and keep it there until struct is dropped.
+	///
+	/// You can `clone` this database or you can `create_context` from it
+	/// (which also does `clone`) to run actual operation against new database
+	/// which will be identical to the original.
+	pub fn new(database_type: DatabaseType, keyring_length: usize) -> Self {
+		Self::with_key_types(database_type, keyring_length, KeyTypes::Sr25519)
+	}
+
+	// This should return client that is doing everything that full node
+	// is doing.
+	//
+	// - This client should use best wasm execution method.
+	// - This client should work with real database only.
+	fn bench_client(
+		database_type: DatabaseType,
+		dir: &std::path::Path,
+		keyring: &BenchKeyring,
+	) -> (Client, std::sync::Arc<Backend>, TaskExecutor) {
+		let db_config = sc_client_db::DatabaseSettings {
+			trie_cache_maximum_size: Some(16 * 1024 * 1024),
+			state_pruning: Some(PruningMode::ArchiveAll),
+			source: database_type.into_settings(dir.into()),
+			blocks_pruning: sc_client_db::BlocksPruning::KeepAll,
+		};
+		let task_executor = TaskExecutor::new();
+
+		let backend = sc_service::new_db_backend(db_config).expect("Should not fail");
+		let executor = NativeElseWasmExecutor::new_with_wasm_executor(
+			sc_executor::WasmExecutor::builder()
+				.with_execution_method(WasmExecutionMethod::Compiled {
+					instantiation_strategy: WasmtimeInstantiationStrategy::PoolingCopyOnWrite,
+				})
+				.build(),
+		);
+
+		let client_config = sc_service::ClientConfig::default();
+		let genesis_block_builder = sc_service::GenesisBlockBuilder::new(
+			&keyring.generate_genesis(),
+			!client_config.no_genesis,
+			backend.clone(),
+			executor.clone(),
+		)
+		.expect("Failed to create genesis block builder");
+
+		let client = sc_service::new_client(
+			backend.clone(),
+			executor.clone(),
+			genesis_block_builder,
+			None,
+			None,
+			ExecutionExtensions::new(None, Arc::new(executor)),
+			Box::new(task_executor.clone()),
+			None,
+			None,
+			client_config,
+		)
+		.expect("Should not fail");
+
+		(client, backend, task_executor)
+	}
+
+	/// Generate list of required inherents.
+	///
+	/// Uses already instantiated Client.
+	pub fn generate_inherents(&mut self, client: &Client) -> Vec<OpaqueExtrinsic> {
+		let mut inherent_data = InherentData::new();
+		let timestamp = 1 * MinimumPeriod::get();
+
+		inherent_data
+			.put_data(sp_timestamp::INHERENT_IDENTIFIER, &timestamp)
+			.expect("Put timestamp failed");
+
+		client
+			.runtime_api()
+			.inherent_extrinsics(client.chain_info().genesis_hash, inherent_data)
+			.expect("Get inherents failed")
+	}
+
+	/// Iterate over some block content with transaction signed using this database keyring.
+	pub fn block_content(&self, content: BlockContent, client: &Client) -> BlockContentIterator {
+		BlockContentIterator::new(content, &self.keyring, client)
+	}
+
+	/// Get cliet for this database operations.
+	pub fn client(&mut self) -> Client {
+		let (client, _backend, _task_executor) =
+			Self::bench_client(self.database_type, self.directory_guard.path(), &self.keyring);
+
+		client
+	}
+
+	/// Generate new block using this database.
+	pub fn generate_block(&mut self, content: BlockContent) -> Block {
+		let client = self.client();
+
+		let mut block = client.new_block(Default::default()).expect("Block creation failed");
+
+		for extrinsic in self.generate_inherents(&client) {
+			block.push(extrinsic).expect("Push inherent failed");
+		}
+
+		let start = std::time::Instant::now();
+		for opaque in self.block_content(content, &client) {
+			match block.push(opaque) {
+				Err(sp_blockchain::Error::ApplyExtrinsicFailed(
+					sp_blockchain::ApplyExtrinsicFailed::Validity(e),
+				)) if e.exhausted_resources() => break,
+				Err(err) => panic!("Error pushing transaction: {:?}", err),
+				Ok(_) => {},
+			}
+		}
+
+		let block = block.build().expect("Block build failed").block;
+
+		log::info!(
+			target: "bench-logistics",
+			"Block construction: {:#?} ({} tx)",
+			start.elapsed(), block.extrinsics.len()
+		);
+
+		block
+	}
+
+	/// Database path.
+	pub fn path(&self) -> &Path {
+		self.directory_guard.path()
+	}
+
+	/// Clone this database and create context for testing/benchmarking.
+	pub fn create_context(&self) -> BenchContext {
+		let BenchDb { directory_guard, keyring, database_type } = self.clone();
+		let (client, backend, task_executor) =
+			Self::bench_client(database_type, directory_guard.path(), &keyring);
+
+		BenchContext {
+			client: Arc::new(client),
+			db_guard: directory_guard,
+			backend,
+			spawn_handle: Box::new(task_executor),
+		}
+	}
+}
+
+/// Key types to be used in benching keyring
+pub enum KeyTypes {
+	/// sr25519 signing keys
+	Sr25519,
+	/// ed25519 signing keys
+	Ed25519,
+}
+
+impl BenchKeyring {
+	/// New keyring.
+	///
+	/// `length` is the number of accounts generated.
+	pub fn new(length: usize, key_types: KeyTypes) -> Self {
+		let mut accounts = BTreeMap::new();
+
+		for n in 0..length {
+			let seed = format!("//endowed-user/{}", n);
+			let (account_id, pair) = match key_types {
+				KeyTypes::Sr25519 => {
+					let pair =
+						sr25519::Pair::from_string(&seed, None).expect("failed to generate pair");
+					let account_id = AccountPublic::from(pair.public()).into_account();
+					(account_id, BenchPair::Sr25519(pair))
+				},
+				KeyTypes::Ed25519 => {
+					let pair = ed25519::Pair::from_seed(&blake2_256(seed.as_bytes()));
+					let account_id = AccountPublic::from(pair.public()).into_account();
+					(account_id, BenchPair::Ed25519(pair))
+				},
+			};
+			accounts.insert(account_id, pair);
+		}
+
+		Self { accounts }
+	}
+
+	/// Generated account id-s from keyring keypairs.
+	pub fn collect_account_ids(&self) -> Vec<AccountId> {
+		self.accounts.keys().cloned().collect()
+	}
+
+	/// Get account id at position `index`
+	pub fn at(&self, index: usize) -> AccountId {
+		self.accounts.keys().nth(index).expect("Failed to get account").clone()
+	}
+
+	/// Sign transaction with keypair from this keyring.
+	pub fn sign(
+		&self,
+		xt: CheckedExtrinsic,
+		spec_version: u32,
+		tx_version: u32,
+		genesis_hash: [u8; 32],
+	) -> UncheckedExtrinsic {
+		match xt.signed {
+			Some((signed, extra)) => {
+				let payload = (
+					xt.function,
+					extra.clone(),
+					spec_version,
+					tx_version,
+					genesis_hash,
+					genesis_hash,
+					// metadata_hash
+					None::<()>,
+				);
+				let key = self.accounts.get(&signed).expect("Account id not found in keyring");
+				let signature = payload.using_encoded(|b| {
+					if b.len() > 256 {
+						key.sign(&sp_io::hashing::blake2_256(b))
+					} else {
+						key.sign(b)
+					}
+				});
+				UncheckedExtrinsic {
+					signature: Some((sp_runtime::MultiAddress::Id(signed), signature, extra)),
+					function: payload.0,
+				}
+			},
+			None => UncheckedExtrinsic { signature: None, function: xt.function },
+		}
+	}
+
+	/// Generate genesis with accounts from this keyring endowed with some balance.
+	pub fn generate_genesis(&self) -> clarus_runtime::RuntimeGenesisConfig {
+		crate::genesis::config_endowed(
+			Some(clarus_runtime::wasm_binary_unwrap()),
+			self.collect_account_ids(),
+		)
+	}
+}
+
+struct Guard(tempfile::TempDir);
+
+impl Guard {
+	fn path(&self) -> &Path {
+		self.0.path()
+	}
+}
+
+/// Benchmarking/test context holding instantiated client and backend references.
+pub struct BenchContext {
+	/// Node client.
+	pub client: Arc<Client>,
+	/// Node backend.
+	pub backend: Arc<Backend>,
+	/// Spawn handle.
+	pub spawn_handle: Box<dyn SpawnNamed>,
+
+	db_guard: Guard,
+}
+
+type AccountPublic = <Signature as Verify>::Signer;
+
+fn get_from_seed<TPublic: Public>(seed: &str) -> <TPublic::Pair as Pair>::Public {
+	TPublic::Pair::from_string(&format!("//{}", seed), None)
+		.expect("static values are valid; qed")
+		.public()
+}
+
+fn get_account_id_from_seed<TPublic: Public>(seed: &str) -> AccountId
+where
+	AccountPublic: From<<TPublic::Pair as Pair>::Public>,
+{
+	AccountPublic::from(get_from_seed::<TPublic>(seed)).into_account()
+}
+
+impl BenchContext {
+	/// Import some block.
+	pub fn import_block(&mut self, block: Block) {
+		let mut import_params =
+			BlockImportParams::new(BlockOrigin::NetworkBroadcast, block.header.clone());
+		import_params.body = Some(block.extrinsics().to_vec());
+		import_params.fork_choice = Some(ForkChoiceStrategy::LongestChain);
+
+		assert_eq!(self.client.chain_info().best_number, 0);
+
+		assert_eq!(
+			futures::executor::block_on(self.client.import_block(import_params))
+				.expect("Failed to import block"),
+			ImportResult::Imported(ImportedAux {
+				header_only: false,
+				clear_justification_requests: false,
+				needs_justification: false,
+				bad_justification: false,
+				is_new_best: true,
+			})
+		);
+
+		assert_eq!(self.client.chain_info().best_number, 1);
+	}
+
+	/// Database path for the current context.
+	pub fn path(&self) -> &Path {
+		self.db_guard.path()
+	}
 }

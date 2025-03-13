@@ -17,6 +17,7 @@ fs_extra = "1"
 futures = "0.3.21"
 log = "0.4.17"
 tempfile = "3.1.0"
+frame-metadata-hash-extension = {git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 frame-system = {git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 node-executor = { package = "clarus-node-executor", path = "../executor" }
 pallet-asset-conversion = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
@@ -34,7 +35,7 @@ sc-service = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = 
 	"rocksdb",
 ]}
 sp-api = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
-sp-block-builder = { version = "4.0.0-dev", git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
+sp-block-builder = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 sp-blockchain = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 sp-consensus = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 sp-core = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
@@ -44,7 +45,6 @@ sp-keyring = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = 
 sp-runtime = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
 sp-timestamp = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0", default-features = false}
 substrate-test-client = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "release-polkadot-v1.2.0" }
-pallet-transaction-payment = { version = "4.0.0-dev", branch = "release-polkadot-v1.2.0", git = "https://github.com/paritytech/polkadot-sdk.git" }
 
 #local dependencies
 node-primitives = { path = "../primitives" }

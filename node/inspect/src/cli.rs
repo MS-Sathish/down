@@ -25,7 +25,7 @@ use sc_cli::{ImportParams, SharedParams};
 pub struct InspectCmd {
     #[allow(missing_docs)]
     #[clap(subcommand)]
-    pub command: InspectSubCmd,
+    pub command: InspectSubCmd, 
 
     #[allow(missing_docs)]
     #[clap(flatten)]
